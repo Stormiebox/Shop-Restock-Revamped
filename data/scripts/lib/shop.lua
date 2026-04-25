@@ -1,8 +1,9 @@
--- Shop Restock Button logic with new Cooldown logic
+-- Shop Restock Button logic with new Cooldown and Pricing logics
 local edr_buildBuyGui, edr_CreateNamespace -- extended functions
+local edr_generateSeed
 local edr_restockButton                    -- UI
 local edr_specialOfferSeed = 0             -- restock the special offer
-local restockCooldown = 15 * 60            -- 15 minutes in seconds
+local restockCooldown = 45 * 60            -- 45 minutes in seconds
 local lastRestockTime = 0
 local freeRestockCount = 5                 -- Allow 5 free restocks
 local usedFreeRestocks = 0                 -- Counter for used free restocks
@@ -10,16 +11,22 @@ local ShopRestockPrice = 5000              -- Initial restock price
 local RestockPriceScalingFactor = 1.5      -- Price scaling factor
 local MaxPurchasedRestocks = 15            -- Maximum purchased restocks before price reset
 local PurchasedRestockCount = 0            -- Counter for purchased restocks
+-- NOTE: these counters are currently script-lifetime/session scoped unless persisted explicitly.
 
 -- Handle the actual restocking part
 if onServer() then
     edr_generateSeed = Shop.generateSeed
     function Shop:generateSeed(...)
-        if self.staticSeed then
-            return edr_generateSeed(self, ...)
-        else
-            return edr_generateSeed(self, ...) .. edr_specialOfferSeed
+        if not edr_generateSeed then
+            return nil
         end
+
+        local baseSeed = edr_generateSeed(self, ...)
+        if self.staticSeed then
+            return baseSeed
+        end
+
+        return tostring(baseSeed) .. tostring(edr_specialOfferSeed)
     end
 
     function Shop:remoteRestock()
@@ -27,14 +34,39 @@ if onServer() then
         self:restock()
     end
 
+    function Shop:serverPurchaseRestock()
+        local buyer = Player(callingPlayer)
+        if not buyer then return end
+
+        local currentPrice = ShopRestockPrice * (RestockPriceScalingFactor ^ PurchasedRestockCount)
+
+        if buyer:getMoney() >= currentPrice then
+            buyer:pay("Paid %1% Credits for a Shop Restock."%_T, currentPrice)
+            PurchasedRestockCount = PurchasedRestockCount + 1
+            self:remoteRestock()
+
+            if PurchasedRestockCount >= MaxPurchasedRestocks then
+                PurchasedRestockCount = 0
+            end
+        end
+    end
+
     edr_CreateNamespace = PublicNamespace.CreateNamespace
     function PublicNamespace.CreateNamespace(...)
         local result = edr_CreateNamespace(...)
+        if not result or not result.shop then
+            return result
+        end
 
-        result.remoteRestock = function(...) return result.shop:remoteRestock(...) end
+        result.remoteRestock = function(...)
+            return result.shop:remoteRestock(...)
+        end
+        result.serverPurchaseRestock = function(...)
+            return result.shop:serverPurchaseRestock(...)
+        end
 
         callable(result, "remoteRestock")
-
+        callable(result, "serverPurchaseRestock")
         return result
     end
 end
@@ -50,25 +82,29 @@ if onClient() then
 
         -- Create the restock button
         edr_restockButton = tab:createButton(Rect(x, 0, x + 160, 30), "", "edr_onRestockButtonPressed")
-        edr_restockButton.icon = "data/textures/icons/clockwise-rotation.png"
-        edr_restockButton.tooltip = "Click to restock the shop" % _t
+        if edr_restockButton then
+            edr_restockButton.icon = "data/textures/icons/clockwise-rotation.png"
+            edr_restockButton.tooltip = "Click to restock the shop" % _t
+        end
     end
 
     function Shop:edr_onRestockButtonPressed(button)
+        local player = Player()
+        if not player then return end
         local currentTime = os.time()
 
         -- Check if the player can restock for free
         if usedFreeRestocks < freeRestockCount then
             -- Allow free restock
             usedFreeRestocks = usedFreeRestocks + 1
-            invokeServerFunction("remoteRestock") -- Call the server function to restock
-            Player():sendChatMessage(
+            invokeServerFunction("remoteRestock")
+            player:sendChatMessage(
                 "Free restock used. You have " .. (freeRestockCount - usedFreeRestocks) .. " free restocks left.", 1)
         elseif currentTime - lastRestockTime >= restockCooldown then
             -- Cooldown has passed
             lastRestockTime = currentTime         -- Update the last restock time
-            invokeServerFunction("remoteRestock") -- Call the server function to restock
-            Player():sendChatMessage("Shop restocked. Next restock available in 15 minutes.", 1)
+            invokeServerFunction("remoteRestock")
+            player:sendChatMessage("Shop restocked. Next restock available in 45 minutes.", 1)
         else
             -- Calculate remaining cooldown time
             local remainingCooldown = restockCooldown - (currentTime - lastRestockTime)
@@ -76,7 +112,7 @@ if onClient() then
             local seconds = remainingCooldown % 60
 
             -- Provide feedback to the player with remaining cooldown time
-            Player():sendChatMessage(
+            player:sendChatMessage(
                 string.format("Restock is on cooldown for %d minutes and %d seconds. Please wait.", minutes, seconds), 1)
         end
     end
@@ -85,36 +121,37 @@ if onClient() then
         -- Calculate the current price based on the number of purchased restocks
         local currentPrice = ShopRestockPrice * (RestockPriceScalingFactor ^ PurchasedRestockCount)
 
+        local player = Player()
+        if not player then return end
+
         -- Check if the player can afford the restock
-        if Player():getMoney() >= currentPrice then
-            -- Deduct the restock price from the player's money
-            Player():subtractMoney(currentPrice)
+        if player:getMoney() >= currentPrice then
+            -- Server-authoritative purchase + restock
+            invokeServerFunction("serverPurchaseRestock")
 
-            -- Increment the purchased restock counter
-            PurchasedRestockCount = PurchasedRestockCount + 1
-
-            -- Restock the shop
-            invokeServerFunction("remoteRestock")
-
-            -- Send a chat message to the player indicating the purchase
-            Player():sendChatMessage("You just spent " .. currentPrice .. " credits for a shop restock!", 1)
-
-            -- Reset price if the limit is reached
-            if PurchasedRestockCount >= MaxPurchasedRestocks then
-                PurchasedRestockCount = 0
-            end
+            -- Send a chat message to the player indicating the purchase request
+            player:sendChatMessage("Purchase request sent for shop restock: " .. currentPrice .. " credits.", 1)
         else
             -- Display a message indicating that the player cannot afford the restock
-            Player():sendChatMessage(
-            "You cannot afford to restock. The current price is " .. currentPrice .. " credits.", 1)
+            player:sendChatMessage(
+                "You cannot afford to restock. The current price is " .. currentPrice .. " credits.", 1)
         end
     end
 
     edr_CreateNamespace = PublicNamespace.CreateNamespace
     function PublicNamespace.CreateNamespace(...)
         local result = edr_CreateNamespace(...)
-        result.edr_onRestockButtonPressed = function(...) return result.shop:edr_onRestockButtonPressed(...) end
-        result.purchaseRestock = function(...) return result.shop:purchaseRestock(...) end
+        if not result or not result.shop then
+            return result
+        end
+
+        result.edr_onRestockButtonPressed = function(...)
+            return result.shop:edr_onRestockButtonPressed(...)
+        end
+        result.purchaseRestock = function(...)
+            return result.shop:purchaseRestock(...)
+        end
+
         return result
     end
 end
